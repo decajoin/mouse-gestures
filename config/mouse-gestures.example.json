@@ -1,0 +1,16 @@
+{
+  "_comment": "方向记号: L左 R右 U上 D下, 斜向用小键盘方位 9右上 3右下 1左下 7左上。按画的先后顺序拼接。动作支持 key:<组合键> 和 cmd:<命令>",
+  "device": "auto",
+  "trigger_button": "BTN_RIGHT",
+  "min_segment": 40,
+  "min_total": 60,
+  "gestures": {
+    "L":  {"action": "key:alt+left",  "desc": "后退"},
+    "R":  {"action": "key:alt+right", "desc": "前进"},
+    "U":  {"action": "key:ctrl+t",    "desc": "新建标签页"},
+    "D":  {"action": "key:ctrl+w",    "desc": "关闭当前标签页/页面"},
+    "DR": {"action": "key:alt+f4",    "desc": "关闭当前窗口/软件"},
+    "9":  {"action": "key:alt+f10",   "desc": "最大化 / 取消最大化"},
+    "1":  {"action": "key:super+h",   "desc": "最小化"}
+  }
+}

@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""
+mouse-gestures —— Wayland 下可用的鼠标手势守护进程
+
+原理:绕过显示服务器,直接从 evdev 读取物理鼠标事件,用 EVIOCGRAB 独占设备,
+再通过 uinput 建虚拟鼠标把事件转发回系统。因为独占了设备,按住触发键画手势时
+上下文菜单不会弹出;若判定为普通点击,再把按键原样补发。
+
+依赖: python3-evdev, 用户属于 input 组
+"""
+
+import argparse
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+
+try:
+    from evdev import InputDevice, UInput, list_devices, ecodes as e
+except ImportError:
+    sys.exit("缺少 python3-evdev,请先: sudo apt install python3-evdev")
+
+DEFAULT_CONFIG = os.path.expanduser("~/.config/mouse-gestures.json")
+
+MODIFIERS = {
+    "ctrl": e.KEY_LEFTCTRL,
+    "control": e.KEY_LEFTCTRL,
+    "alt": e.KEY_LEFTALT,
+    "shift": e.KEY_LEFTSHIFT,
+    "super": e.KEY_LEFTMETA,
+    "meta": e.KEY_LEFTMETA,
+}
+
+# 少数按键名和 KEY_ 常量对不上,单独映射
+KEY_ALIASES = {
+    "left": "KEY_LEFT",
+    "right": "KEY_RIGHT",
+    "up": "KEY_UP",
+    "down": "KEY_DOWN",
+    "esc": "KEY_ESC",
+    "escape": "KEY_ESC",
+    "enter": "KEY_ENTER",
+    "space": "KEY_SPACE",
+    "tab": "KEY_TAB",
+    "backspace": "KEY_BACKSPACE",
+    "del": "KEY_DELETE",
+    "delete": "KEY_DELETE",
+    "home": "KEY_HOME",
+    "end": "KEY_END",
+    "pgup": "KEY_PAGEUP",
+    "pgdn": "KEY_PAGEDOWN",
+}
+
+
+def resolve_key(name):
+    """把 'ctrl' / 'w' / 'f4' / 'left' 这类名字解析成 evdev 键码。"""
+    name = name.strip().lower()
+    if name in MODIFIERS:
+        return MODIFIERS[name]
+    const = KEY_ALIASES.get(name, "KEY_" + name.upper())
+    code = getattr(e, const, None)
+    if code is None:
+        raise ValueError(f"无法识别的按键: {name}")
+    return code
+
+
+def parse_combo(combo):
+    """'ctrl+shift+t' -> ([ctrl, shift], t)"""
+    parts = [p for p in combo.split("+") if p.strip()]
+    if not parts:
+        raise ValueError("空的按键组合")
+    mods = [resolve_key(p) for p in parts[:-1]]
+    return mods, resolve_key(parts[-1])
+
+
+def find_mice():
+    """列出所有看起来像鼠标的设备:有相对位移轴,且带右键。
+
+    返回 [(路径, 名称)],路径优先取 /dev/input/by-id/ 下的稳定符号链接 ——
+    event 号会随插拔变化,by-id 不会。
+    """
+    by_id = {}
+    id_dir = "/dev/input/by-id"
+    if os.path.isdir(id_dir):
+        for name in os.listdir(id_dir):
+            link = os.path.join(id_dir, name)
+            by_id.setdefault(os.path.realpath(link), link)
+
+    found = []
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        caps = dev.capabilities(absinfo=False)
+        rel = caps.get(e.EV_REL, [])
+        keys = caps.get(e.EV_KEY, [])
+        # 跳过 uinput 造出来的虚拟指针(本程序自己的、keyd 的等等) ——
+        # 接管它们要么形成回环,要么接到一个随时会消失的设备上
+        virtual = ("virtual" in dev.name.lower()
+                   or dev.name.startswith("mouse-gestures-"))
+        if e.REL_X in rel and e.REL_Y in rel and e.BTN_RIGHT in keys and not virtual:
+            link = by_id.get(path)
+            found.append((link or path, dev.name, link is not None))
+        dev.close()
+
+    # 有 by-id 稳定路径的排前面(通常是外接鼠标,也是 auto 该选的那个),
+    # 其次按 event 号数字序 —— 字符串序会把 event17 排到 event7 前面
+    def sort_key(item):
+        path = item[0]
+        num = int("".join(filter(str.isdigit, os.path.basename(path))) or 0)
+        return (not item[2], num)
+
+    return [(p, n) for p, n, _ in sorted(found, key=sort_key)]
+
+
+def resolve_device(spec):
+    """把配置里的 device 解析成真实路径;'auto' 表示自动挑第一个鼠标。"""
+    if spec != "auto":
+        return spec
+    mice = find_mice()
+    if not mice:
+        sys.exit("未找到鼠标设备。用 mouse-gestures --list-devices 查看,再写进配置")
+    return mice[0][0]
+
+
+class Config:
+    def __init__(self, path):
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        self.device = resolve_device(raw.get("device", "auto"))
+        self.trigger = getattr(e, raw.get("trigger_button", "BTN_RIGHT"))
+        self.min_segment = raw.get("min_segment", 40)
+        self.min_total = raw.get("min_total", 60)
+        self.gestures = {k: v["action"] for k, v in raw["gestures"].items()}
+        self.descs = {k: v.get("desc", "") for k, v in raw["gestures"].items()}
+
+    def keyboard_caps(self):
+        """构造虚拟键盘需要声明的键码集合 —— 只声明配置里真正用到的。"""
+        codes = set(MODIFIERS.values())
+        for action in self.gestures.values():
+            if action.startswith("key:"):
+                mods, key = parse_combo(action[4:])
+                codes.update(mods)
+                codes.add(key)
+        return sorted(codes)
+
+
+# 8 个方向,每 45 度一档。从正右开始按屏幕坐标顺时针排列(y 轴向下),
+# 斜向沿用小键盘方位记号,避免和 L/R/U/D 组成的序列混淆。
+DIRECTIONS = ["R", "3", "D", "1", "L", "7", "U", "9"]
+
+DIRECTION_NAMES = {
+    "R": "右", "L": "左", "U": "上", "D": "下",
+    "9": "右上", "3": "右下", "1": "左下", "7": "左上",
+}
+
+
+def recognize(path, min_segment):
+    """把轨迹点序列压缩成方向串,例如 [(0,0),(120,0),(120,90)] -> 'RD'。"""
+    if len(path) < 2:
+        return None
+    dirs = []
+    anchor = path[0]
+    for point in path[1:]:
+        dx = point[0] - anchor[0]
+        dy = point[1] - anchor[1]
+        if math.hypot(dx, dy) < min_segment:
+            continue
+        sector = round(math.atan2(dy, dx) / (math.pi / 4)) % 8
+        d = DIRECTIONS[sector]
+        if not dirs or dirs[-1] != d:
+            dirs.append(d)
+        anchor = point
+    return "".join(dirs) if dirs else None
+
+
+class GestureDaemon:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.dev = InputDevice(cfg.device)
+
+        caps = self.dev.capabilities(absinfo=False)
+        caps.pop(e.EV_SYN, None)  # UInput 自带 SYN,重复声明会报错
+        self.ui_mouse = UInput(caps, name="mouse-gestures-virtual-mouse")
+        self.ui_kbd = UInput(
+            {e.EV_KEY: cfg.keyboard_caps()}, name="mouse-gestures-virtual-kbd"
+        )
+
+        self.tracking = False
+        self.path = []
+        self.pos = [0, 0]
+        self._stop = False
+
+    # ---------- 动作执行 ----------
+
+    def send_combo(self, combo):
+        mods, key = parse_combo(combo)
+        for m in mods:
+            self.ui_kbd.write(e.EV_KEY, m, 1)
+        self.ui_kbd.write(e.EV_KEY, key, 1)
+        self.ui_kbd.syn()
+        time.sleep(0.01)
+        self.ui_kbd.write(e.EV_KEY, key, 0)
+        for m in reversed(mods):
+            self.ui_kbd.write(e.EV_KEY, m, 0)
+        self.ui_kbd.syn()
+
+    def run_action(self, gesture):
+        readable = "".join(DIRECTION_NAMES.get(c, c) for c in gesture)
+        action = self.cfg.gestures.get(gesture)
+        if action is None:
+            print(f"[手势] {gesture} ({readable}) —— 未绑定", flush=True)
+            return False
+        desc = self.cfg.descs.get(gesture, "")
+        print(f"[手势] {gesture} ({readable}) -> {desc} ({action})", flush=True)
+        try:
+            if action.startswith("key:"):
+                self.send_combo(action[4:])
+            elif action.startswith("cmd:"):
+                subprocess.Popen(
+                    action[4:], shell=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            else:
+                print(f"  未知动作类型: {action}", flush=True)
+                return False
+        except Exception as exc:                      # 动作失败不能拖垮守护进程
+            print(f"  执行失败: {exc}", flush=True)
+            return False
+        return True
+
+    def replay_click(self):
+        """判定为普通点击,把吞掉的那次按键补发出去。"""
+        for value in (1, 0):
+            self.ui_mouse.write(e.EV_KEY, self.cfg.trigger, value)
+            self.ui_mouse.syn()
+            time.sleep(0.01)
+
+    # ---------- 主循环 ----------
+
+    def stop(self, *_):
+        self._stop = True
+
+    def run(self):
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+
+        self.dev.grab()
+        print(f"已接管 {self.dev.name} ({self.cfg.device})", flush=True)
+        print(f"按住{'右键' if self.cfg.trigger == e.BTN_RIGHT else '触发键'}画手势;"
+              f"已加载 {len(self.cfg.gestures)} 个手势", flush=True)
+        try:
+            for event in self.dev.read_loop():
+                if self._stop:
+                    break
+
+                if event.type == e.EV_KEY and event.code == self.cfg.trigger:
+                    if event.value == 1:
+                        self.tracking = True
+                        self.pos = [0, 0]
+                        self.path = [(0, 0)]
+                        continue          # 先吞掉,等松手再决定
+                    if event.value == 0 and self.tracking:
+                        self.tracking = False
+                        travel = max(abs(self.pos[0]), abs(self.pos[1]))
+                        gesture = (
+                            recognize(self.path, self.cfg.min_segment)
+                            if travel >= self.cfg.min_total else None
+                        )
+                        if gesture is None or not self.run_action(gesture):
+                            self.replay_click()
+                        continue
+
+                if self.tracking and event.type == e.EV_REL:
+                    if event.code == e.REL_X:
+                        self.pos[0] += event.value
+                    elif event.code == e.REL_Y:
+                        self.pos[1] += event.value
+                    self.path.append(tuple(self.pos))
+
+                self.ui_mouse.write_event(event)   # 其余事件原样转发
+        finally:
+            try:
+                self.dev.ungrab()
+            except Exception:
+                pass
+            self.ui_mouse.close()
+            self.ui_kbd.close()
+            print("已释放设备", flush=True)
+
+
+# ---------- 子命令 ----------
+
+def cmd_list_devices():
+    mice = find_mice()
+    if not mice:
+        print("没找到鼠标设备(需要属于 input 组才能读 /dev/input/*)")
+        return 1
+    print("检测到的鼠标设备(把路径填进配置的 device 字段):\n")
+    for path, name in mice:
+        print(f"  {name}\n    {path}\n")
+    return 0
+
+
+def cmd_doctor(config_path):
+    """逐项检查运行前提。每条都给出可直接执行的修复命令。"""
+    ok = True
+
+    def check(label, passed, hint=""):
+        nonlocal ok
+        print(f"  [{'✓' if passed else '✗'}] {label}")
+        if not passed:
+            ok = False
+            if hint:
+                print(f"      → {hint}")
+
+    print("检查运行前提:\n")
+
+    import grp
+    try:
+        in_input = os.getlogin() in grp.getgrnam("input").gr_mem
+    except (OSError, KeyError):
+        in_input = "input" in [grp.getgrgid(g).gr_name for g in os.getgroups()]
+    check("用户属于 input 组", in_input,
+          "sudo usermod -aG input $USER  然后注销重新登录")
+
+    check("/dev/uinput 可写", os.access("/dev/uinput", os.W_OK),
+          "确认 udev 规则给了 input 组权限,或重新登录使组权限生效")
+
+    check(f"配置文件存在 ({config_path})", os.path.exists(config_path),
+          "cp config/mouse-gestures.example.json ~/.config/mouse-gestures.json")
+
+    mice = find_mice()
+    check("找到鼠标设备", bool(mice), "mouse-gestures --list-devices")
+
+    # 设备独占冲突 —— keyd 这类工具默认会 grab 所有输入设备,包括鼠标。
+    # 本程序自己在跑时也会占着设备,那不算冲突,先排除掉这种情况。
+    self_running = subprocess.run(
+        ["pgrep", "-f", "bin/mouse-gestures$"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if self_running:
+        print("  [-] 鼠标独占检查已跳过 —— 守护进程正在运行(它本就占着设备)")
+    elif mice and os.path.exists(config_path):
+        try:
+            cfg_dev = resolve_device(
+                json.load(open(config_path, encoding="utf-8")).get("device", "auto"))
+            dev = InputDevice(cfg_dev)
+            try:
+                dev.grab()
+                dev.ungrab()
+                check("鼠标未被其他程序独占", True)
+            except OSError:
+                check("鼠标未被其他程序独占", False,
+                      "有程序抢先 EVIOCGRAB 了。常见元凶是 keyd —— 它的 "
+                      "[ids] 段若为 * 会连鼠标一起接管。\n"
+                      "        在 /etc/keyd/default.conf 的 [ids] 段加一行 "
+                      "-<vid>:<pid> 排除本鼠标,再 sudo systemctl restart keyd")
+            dev.close()
+        except (OSError, ValueError, KeyError) as exc:
+            check("鼠标未被其他程序独占", False, f"检查失败: {exc}")
+
+    print()
+    print("全部通过,可以启动。" if ok else "有未通过项,按上面的提示修复。")
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="mouse-gestures",
+        description="Wayland 下可用的鼠标手势守护进程",
+    )
+    ap.add_argument("-c", "--config", default=DEFAULT_CONFIG,
+                    help=f"配置文件路径(默认 {DEFAULT_CONFIG})")
+    ap.add_argument("--list-devices", action="store_true",
+                    help="列出可用的鼠标设备后退出")
+    ap.add_argument("--doctor", action="store_true",
+                    help="检查运行前提(权限、设备、独占冲突)后退出")
+    args = ap.parse_args()
+
+    if args.list_devices:
+        sys.exit(cmd_list_devices())
+    if args.doctor:
+        sys.exit(cmd_doctor(args.config))
+
+    if not os.path.exists(args.config):
+        sys.exit(f"配置文件不存在: {args.config}")
+    cfg = Config(args.config)
+    if not os.path.exists(cfg.device):
+        sys.exit(f"鼠标设备不存在: {cfg.device}\n"
+                 f"用 mouse-gestures --list-devices 确认后改配置")
+    try:
+        GestureDaemon(cfg).run()
+    except PermissionError:
+        sys.exit("权限不足。需要: sudo usermod -aG input $USER 然后重新登录")
+    except OSError as exc:
+        if exc.errno == 16:   # EBUSY
+            sys.exit("鼠标已被其他程序独占(常见是 keyd)。"
+                     "跑 mouse-gestures --doctor 看修复方法")
+        raise
+
+
+if __name__ == "__main__":
+    main()
