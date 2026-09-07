@@ -85,6 +85,189 @@ class TestRecognize(unittest.TestCase):
                              f"扇区 {i} (角度 {math.degrees(angle):.0f}°)")
 
 
+def rounded_corner(first, second, length=200, radius=0.3, step=4):
+    """画一条带圆角的两段折线 —— 人画 L 形的真实样子。
+
+    first/second 是 (dx, dy) 单位方向。圆角用二次贝塞尔,radius 是拐角
+    吃掉的比例。真人画不出直角,这个圆弧就是 DR 被识别成 D3R 的根源。
+    """
+    p0 = (0.0, 0.0)
+    p1 = (first[0] * length, first[1] * length)
+    p2 = (p1[0] + second[0] * length, p1[1] + second[1] * length)
+    a = (p1[0] + (p0[0] - p1[0]) * radius, p1[1] + (p0[1] - p1[1]) * radius)
+    b = (p1[0] + (p2[0] - p1[0]) * radius, p1[1] + (p2[1] - p1[1]) * radius)
+    knots = [p0, a]
+    for i in range(1, 12):
+        t = i / 12
+        u = 1 - t
+        knots.append((u * u * a[0] + 2 * u * t * p1[0] + t * t * b[0],
+                      u * u * a[1] + 2 * u * t * p1[1] + t * t * b[1]))
+    knots += [b, p2]
+    path = [p0]
+    for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
+        n = max(1, int(math.hypot(x1 - x0, y1 - y0) / step))
+        path += [(x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n)
+                 for k in range(1, n + 1)]
+    return path
+
+
+class TestSmoothing(unittest.TestCase):
+    """圆角平滑。
+
+    回归点: 人画 L 形不可能是直角,拐角那段圆弧被量化成一个斜向,"先下后右"
+    实测 55% 的情况画出来是 D3R 而不是 DR —— 默认配置绑的 DR(Alt+F4)
+    因此只有 31% 的命中率。
+    """
+
+    MIN_SEG = 40
+
+    def test_rounded_l_shapes(self):
+        """八种 L 形的圆角画法都要还原成两段。"""
+        for want, (a, b) in {
+            "DR": ((0, 1), (1, 0)),
+            "DL": ((0, 1), (-1, 0)),
+            "UR": ((0, -1), (1, 0)),
+            "UL": ((0, -1), (-1, 0)),
+            "RD": ((1, 0), (0, 1)),
+            "RU": ((1, 0), (0, -1)),
+            "LD": ((-1, 0), (0, 1)),
+            "LU": ((-1, 0), (0, -1)),
+        }.items():
+            with self.subTest(want):
+                self.assertEqual(
+                    mg.recognize(rounded_corner(a, b), self.MIN_SEG), want)
+
+    def test_sharp_corner_still_works(self):
+        """没有圆角的理想 L 形不能被平滑改坏。"""
+        path = [(0, y) for y in range(0, 201, 5)] + [(x, 200) for x in range(0, 201, 5)]
+        self.assertEqual(mg.recognize(path, self.MIN_SEG), "DR")
+
+    def test_only_interior_runs_are_dropped(self):
+        """首尾的短段要留着 —— 抹掉会把 DR 变成 D 或 R,反而丢信息。"""
+        runs = [["D", 30], ["R", 300], ["U", 30]]
+        self.assertEqual(mg.smooth_runs([list(r) for r in runs], self.MIN_SEG), runs)
+
+    def test_dropped_length_is_conserved(self):
+        """被抹掉的长度要并给邻居,不能凭空丢 —— 否则反复平滑越削越短。"""
+        out = mg.smooth_runs([["D", 200], ["3", 30], ["R", 200]], self.MIN_SEG)
+        self.assertEqual([d for d, _ in out], ["D", "R"])
+        self.assertEqual(sum(n for _, n in out), 430)
+
+    def test_interior_short_run_is_dropped_and_merged(self):
+        """抹掉中间段后左右同向的话要合并,不能留下 'RR'。"""
+        self.assertEqual(
+            mg.smooth_runs([["R", 200], ["9", 30], ["R", 200]], self.MIN_SEG),
+            [["R", 430]])
+
+    def test_long_interior_run_is_kept(self):
+        """真的画了一段斜向就不能抹 —— 否则 D3R 这种真实手势没法表达。"""
+        runs = [["D", 200], ["3", 200], ["R", 200]]
+        self.assertEqual(mg.smooth_runs(list(runs), self.MIN_SEG), runs)
+
+
+class TestEditDistance(unittest.TestCase):
+    def test_basics(self):
+        self.assertEqual(mg.edit_distance("", ""), 0)
+        self.assertEqual(mg.edit_distance("L1D3", "L1D3"), 0)
+        self.assertEqual(mg.edit_distance("L1D3", "L1D"), 1)      # 删一个
+        self.assertEqual(mg.edit_distance("7L1D3", "L1D3"), 1)    # 加一个
+        self.assertEqual(mg.edit_distance("L1D3", "L1D9"), 1)     # 换一个
+        self.assertEqual(mg.edit_distance("L", "R"), 1)
+
+
+class TestMatchGesture(unittest.TestCase):
+    """模糊匹配。C 形这类曲线手势的起笔收笔位置每次都不同,同一个 C 能画出
+    二十几种方向串,精确匹配只有 20% 命中。"""
+
+    PATTERNS = ["L", "R", "U", "D", "DR", "9", "1", "7", "7L1D3R"]
+
+    # 真机采集: 同一个人连画 17 笔 C,识别器吐出的全部写法。规范式 7L1D3R
+    # 就是按这份分布选的 —— 起笔在左上(7)、收笔带 R,和仿真猜的 L1D3 不一样。
+    REAL_C = ["7L1D3R", "71DR", "71D3R", "U1D3R", "L1D3R", "7LDR", "713R", "L1DR"]
+
+    def match(self, observed):
+        return mg.match_gesture(observed, self.PATTERNS)
+
+    def test_exact_match_wins(self):
+        for g in self.PATTERNS:
+            with self.subTest(g):
+                self.assertEqual(self.match(g), g)
+
+    def test_real_c_shape_variants(self):
+        """真机采集到的 8 种 C 形写法都要归到规范式。"""
+        for observed in self.REAL_C:
+            with self.subTest(observed):
+                self.assertEqual(self.match(observed), "7L1D3R")
+
+    def test_threshold_applies_before_ties(self):
+        """够不着的模式不该有资格参与平局。
+
+        回归点: '71DR' 到 'DR' 和到 '7L1D3R' 都是距离 2,原先任何平局一律
+        否决,于是这一笔被丢掉。但 'DR' 长度 2、阈值只有 1,本就够不着。
+        真机 17 笔里有 5 笔栽在这上面(71%)。
+        """
+        self.assertEqual(mg.edit_distance("71DR", "DR"), 2)
+        self.assertEqual(mg.edit_distance("71DR", "7L1D3R"), 2)
+        self.assertEqual(self.match("71DR"), "7L1D3R")
+
+    def test_single_direction_requires_exact(self):
+        """单向手势阈值为 0 —— 否则随便画一笔都会被吸到 L 上。"""
+        self.assertIsNone(mg.match_gesture("L3", ["L"]))
+        self.assertIsNone(mg.match_gesture("RD", ["R"]))
+
+    def test_ties_are_rejected(self):
+        """两个模式一样近时不猜 —— 宁可补发右键,也不要执行错的动作。"""
+        self.assertIsNone(mg.match_gesture("L1", ["L", "1"]))
+
+    def test_too_far_is_unbound(self):
+        self.assertIsNone(self.match("RRRRRR"))
+        self.assertIsNone(self.match("9U7L1D3R9U"))   # 离规范式 4 段
+        self.assertIsNone(self.match("3R9U7L1D"))
+
+    def test_two_extra_segments_still_match(self):
+        """长手势允许差 2 段 —— C 形起笔多带一个小勾还是它。"""
+        self.assertEqual(mg.edit_distance("9U7L1D3R", "7L1D3R"), 2)
+        self.assertEqual(self.match("9U7L1D3R"), "7L1D3R")
+
+    def test_l_shape_tolerates_one_slip(self):
+        """DR 长度 2,阈值 1 —— 少画或多画一段还认得出。"""
+        self.assertEqual(self.match("DR3"), "DR")
+
+    def test_empty_patterns(self):
+        self.assertIsNone(mg.match_gesture("L", []))
+
+    def test_nearest_returns_all_ties(self):
+        """并列的候选要全部返回,交给调用方按动作去歧义。"""
+        self.assertEqual(sorted(mg.nearest_gestures("XY", ["XZ", "WY"])),
+                         ["WY", "XZ"])
+
+
+class TestConfigMatch(unittest.TestCase):
+    """Config.match 在 nearest_gestures 之上按动作去歧义。"""
+
+    class FakeConfig:
+        fuzzy = True
+        match = mg.Config.match
+
+        def __init__(self, gestures):
+            self.gestures = gestures
+
+    def test_same_action_ties_are_not_ambiguous(self):
+        """同一个动作绑多种写法时,并列不算歧义 —— 否则绑别名反而更差。"""
+        cfg = self.FakeConfig({"XZ": "cmd:foo", "WY": "cmd:foo"})
+        self.assertIn(cfg.match("XY"), ("XZ", "WY"))
+
+    def test_different_action_ties_are_rejected(self):
+        cfg = self.FakeConfig({"XZ": "cmd:foo", "WY": "cmd:bar"})
+        self.assertIsNone(cfg.match("XY"))
+
+    def test_fuzzy_can_be_disabled(self):
+        cfg = self.FakeConfig({"7L1D3R": "cmd:foo"})
+        cfg.fuzzy = False
+        self.assertIsNone(cfg.match("71DR"))
+        self.assertEqual(cfg.match("7L1D3R"), "7L1D3R")
+
+
 class TestPathExtent(unittest.TestCase):
     """min_total 这道闸用的度量。
 

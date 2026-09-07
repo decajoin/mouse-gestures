@@ -136,8 +136,22 @@ class Config:
         self.trigger = getattr(e, raw.get("trigger_button", "BTN_RIGHT"))
         self.min_segment = raw.get("min_segment", 40)
         self.min_total = raw.get("min_total", 60)
+        self.fuzzy = raw.get("fuzzy_match", True)
         self.gestures = {k: v["action"] for k, v in raw["gestures"].items()}
         self.descs = {k: v.get("desc", "") for k, v in raw["gestures"].items()}
+
+    def match(self, gesture):
+        """识别结果 -> 配置里的手势键。fuzzy_match 关掉时退化成精确匹配。"""
+        if not self.fuzzy:
+            return gesture if gesture in self.gestures else None
+        candidates = nearest_gestures(gesture, self.gestures)
+        if not candidates:
+            return None
+        # 并列的候选只要绑的是同一个动作就没有歧义 —— 这样才能给同一个动作
+        # 绑多种写法。绑的动作不同才是真歧义: 宁可补发右键,也不要执行错的。
+        if len({self.gestures[c] for c in candidates}) > 1:
+            return None
+        return candidates[0]
 
     def keyboard_caps(self):
         """构造虚拟键盘需要声明的键码集合 —— 只声明配置里真正用到的。"""
@@ -171,23 +185,109 @@ def path_extent(path):
     return max(math.hypot(x, y) for x, y in path) if path else 0.0
 
 
-def recognize(path, min_segment):
-    """把轨迹点序列压缩成方向串,例如 [(0,0),(120,0),(120,90)] -> 'RD'。"""
-    if len(path) < 2:
-        return None
-    dirs = []
+# 中间那一段短于 SMOOTH_FACTOR * min_segment 就当成拐角噪声抹掉。
+# 2.0 是实测挑的: 再小抹不干净圆角,再大会把真正的短笔画吃掉。
+SMOOTH_FACTOR = 2.0
+
+
+def direction_runs(path, min_segment):
+    """把轨迹压成 [[方向, 该方向累计走了多长], ...]。
+
+    比只留方向多记一个长度,是为了后面能分辨"用户真的画了这一笔"和
+    "这是拐角处甩出来的一点点弧"。
+    """
+    runs = []
     anchor = path[0]
     for point in path[1:]:
         dx = point[0] - anchor[0]
         dy = point[1] - anchor[1]
-        if math.hypot(dx, dy) < min_segment:
+        length = math.hypot(dx, dy)
+        if length < min_segment:
             continue
-        sector = round(math.atan2(dy, dx) / (math.pi / 4)) % 8
-        d = DIRECTIONS[sector]
-        if not dirs or dirs[-1] != d:
-            dirs.append(d)
+        d = DIRECTIONS[round(math.atan2(dy, dx) / (math.pi / 4)) % 8]
+        if runs and runs[-1][0] == d:
+            runs[-1][1] += length
+        else:
+            runs.append([d, length])
         anchor = point
-    return "".join(dirs) if dirs else None
+    return runs
+
+
+def smooth_runs(runs, min_segment):
+    """丢掉夹在中间的短段 —— 圆角和折返处的产物,不是用户想画的那一笔。
+
+    人画 L 形不可能是直角,拐角那段圆弧会被量化成一个斜向,于是"先下后右"
+    画出来 55% 的情况是 D3R 而不是 DR。折返手势同理: UD 掉头处会插进一个
+    斜向,变成 U3D。这类噪声段都很短,而用户真正想画的一笔很长。
+
+    只抹中间段: 首尾段短是"起笔/收笔带了个小勾",抹掉会把 DR 变成 D 或 R,
+    反而丢信息。
+    """
+    threshold = SMOOTH_FACTOR * min_segment
+    while len(runs) > 2:
+        for i in range(1, len(runs) - 1):
+            if runs[i][1] < threshold:
+                # 被抹掉的长度并给前一段,不能凭空丢 —— 否则反复平滑会把
+                # 各段越削越短,进而误触发更多平滑。并给谁是任意的,这点
+                # 长度按定义就小于阈值,不影响后续判断。
+                dropped = runs.pop(i)[1]
+                if runs[i - 1][0] == runs[i][0]:   # 抹掉之后左右同向,合并
+                    runs[i - 1][1] += dropped + runs[i][1]
+                    del runs[i]
+                else:
+                    runs[i - 1][1] += dropped
+                break
+        else:
+            break
+    return runs
+
+
+def recognize(path, min_segment):
+    """把轨迹点序列压缩成方向串,例如 [(0,0),(120,0),(120,90)] -> 'RD'。"""
+    if len(path) < 2:
+        return None
+    runs = smooth_runs(direction_runs(path, min_segment), min_segment)
+    return "".join(d for d, _ in runs) or None
+
+
+def edit_distance(a, b):
+    """两个方向串之间的 Levenshtein 距离。"""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def nearest_gestures(observed, patterns):
+    """离 observed 最近的已绑定手势,并列时返回多个;都够不着就返回 []。
+
+    先精确匹配;不中再按编辑距离找最近的。曲线类手势(C 形之类)的起笔收笔
+    位置每次都不一样,同一个 C 能画出十几种方向串,精确匹配只有 40% 命中。
+
+    阈值随模式长度收紧(len // 2,上限 2): 单向手势只接受精确匹配 —— 否则
+    随便画一笔都会被吸到 'L' 上;越长的手势差一两段也还是它。
+
+    阈值必须在判平局之前生效,够不着的模式不该有资格参与平局。真机实测里
+    '71DR'(画得比较扁的一笔 C)到 'DR' 和到 C 的规范式都是距离 2,而 'DR'
+    长度 2、阈值只有 1,本就够不着,却把这一笔一起否决掉了。
+    """
+    if observed in patterns:
+        return [observed]
+    scored = [(edit_distance(observed, p), p) for p in patterns]
+    scored = [(d, p) for d, p in scored if d <= min(2, len(p) // 2)]
+    if not scored:
+        return []
+    best = min(d for d, _ in scored)
+    return [p for d, p in scored if d == best]
+
+
+def match_gesture(observed, patterns):
+    """离 observed 最近的那个手势;并列或都够不着时返回 None。"""
+    candidates = nearest_gestures(observed, patterns)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 class GestureDaemon:
@@ -226,12 +326,15 @@ class GestureDaemon:
 
     def run_action(self, gesture):
         readable = "".join(DIRECTION_NAMES.get(c, c) for c in gesture)
-        action = self.cfg.gestures.get(gesture)
-        if action is None:
+        key = self.cfg.match(gesture)
+        if key is None:
             print(f"[手势] {gesture} ({readable}) —— 未绑定", flush=True)
             return False
-        desc = self.cfg.descs.get(gesture, "")
-        print(f"[手势] {gesture} ({readable}) -> {desc} ({action})", flush=True)
+        # 模糊命中时把配置里的那个键也打出来,不然日志对不上配置
+        approx = "" if key == gesture else f" ≈ {key}"
+        action = self.cfg.gestures[key]
+        desc = self.cfg.descs.get(key, "")
+        print(f"[手势] {gesture} ({readable}){approx} -> {desc} ({action})", flush=True)
         try:
             if action.startswith("key:"):
                 self.send_combo(action[4:])
