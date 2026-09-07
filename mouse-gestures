@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -159,6 +160,17 @@ DIRECTION_NAMES = {
 }
 
 
+def path_extent(path):
+    """轨迹离起点的最远距离 —— 判断这一笔"画得够不够大"。
+
+    不能用终点的净位移: 往返手势(UD/LR/画圈)终点回到起点附近,净位移接近 0,
+    会被 min_total 当成普通点击丢掉 —— 而且回笔的误差决定了它偶尔又能通过,
+    表现为同一个手势时灵时不灵。
+    也不用累计弧长: 长按时的缓慢抖动会一点点累加,最终凭空越过阈值。
+    """
+    return max(math.hypot(x, y) for x, y in path) if path else 0.0
+
+
 def recognize(path, min_segment):
     """把轨迹点序列压缩成方向串,例如 [(0,0),(120,0),(120,90)] -> 'RD'。"""
     if len(path) < 2:
@@ -194,6 +206,9 @@ class GestureDaemon:
         self.path = []
         self.pos = [0, 0]
         self._stop = False
+        # 自管道: 让信号能立刻打断主循环的 select,见 stop()
+        self._wake_r, self._wake_w = os.pipe()
+        os.set_blocking(self._wake_w, False)
 
     # ---------- 动作执行 ----------
 
@@ -243,7 +258,45 @@ class GestureDaemon:
     # ---------- 主循环 ----------
 
     def stop(self, *_):
+        """信号处理器 —— 设标志位,再戳一下唤醒管道。
+
+        只设标志位是不够的: 主循环阻塞在 select 上,PEP 475 会在处理器返回后
+        自动重启 select,于是要等到下一个鼠标事件才醒得过来。鼠标静止时
+        systemctl stop 会一直挂到 TimeoutStopSec(默认 90s)超时才被 SIGKILL。
+        """
         self._stop = True
+        try:
+            os.write(self._wake_w, b"\0")
+        except OSError:
+            pass
+
+    def handle_event(self, event):
+        """处理单个输入事件:要么消费掉,要么转发给虚拟鼠标。"""
+        if event.type == e.EV_KEY and event.code == self.cfg.trigger:
+            if event.value == 1:
+                self.tracking = True
+                self.pos = [0, 0]
+                self.path = [(0, 0)]
+                return                # 先吞掉,等松手再决定
+            if event.value == 0 and self.tracking:
+                self.tracking = False
+                travel = path_extent(self.path)
+                gesture = (
+                    recognize(self.path, self.cfg.min_segment)
+                    if travel >= self.cfg.min_total else None
+                )
+                if gesture is None or not self.run_action(gesture):
+                    self.replay_click()
+                return
+
+        if self.tracking and event.type == e.EV_REL:
+            if event.code == e.REL_X:
+                self.pos[0] += event.value
+            elif event.code == e.REL_Y:
+                self.pos[1] += event.value
+            self.path.append(tuple(self.pos))
+
+        self.ui_mouse.write_event(event)   # 其余事件原样转发
 
     def run(self):
         signal.signal(signal.SIGTERM, self.stop)
@@ -254,35 +307,15 @@ class GestureDaemon:
         print(f"按住{'右键' if self.cfg.trigger == e.BTN_RIGHT else '触发键'}画手势;"
               f"已加载 {len(self.cfg.gestures)} 个手势", flush=True)
         try:
-            for event in self.dev.read_loop():
-                if self._stop:
+            while not self._stop:
+                readable, _, _ = select.select([self.dev.fd, self._wake_r], [], [])
+                if self._wake_r in readable:
                     break
-
-                if event.type == e.EV_KEY and event.code == self.cfg.trigger:
-                    if event.value == 1:
-                        self.tracking = True
-                        self.pos = [0, 0]
-                        self.path = [(0, 0)]
-                        continue          # 先吞掉,等松手再决定
-                    if event.value == 0 and self.tracking:
-                        self.tracking = False
-                        travel = max(abs(self.pos[0]), abs(self.pos[1]))
-                        gesture = (
-                            recognize(self.path, self.cfg.min_segment)
-                            if travel >= self.cfg.min_total else None
-                        )
-                        if gesture is None or not self.run_action(gesture):
-                            self.replay_click()
-                        continue
-
-                if self.tracking and event.type == e.EV_REL:
-                    if event.code == e.REL_X:
-                        self.pos[0] += event.value
-                    elif event.code == e.REL_Y:
-                        self.pos[1] += event.value
-                    self.path.append(tuple(self.pos))
-
-                self.ui_mouse.write_event(event)   # 其余事件原样转发
+                try:
+                    for event in self.dev.read():
+                        self.handle_event(event)
+                except BlockingIOError:        # select 的虚假唤醒,设备 fd 是非阻塞的
+                    continue
         finally:
             try:
                 self.dev.ungrab()
@@ -290,6 +323,8 @@ class GestureDaemon:
                 pass
             self.ui_mouse.close()
             self.ui_kbd.close()
+            os.close(self._wake_r)
+            os.close(self._wake_w)
             print("已释放设备", flush=True)
 
 
@@ -304,6 +339,50 @@ def cmd_list_devices():
     for path, name in mice:
         print(f"  {name}\n    {path}\n")
     return 0
+
+
+ONESHOT_FLAGS = ("--doctor", "--list-devices")
+
+
+def is_daemon_argv(argv):
+    """一条 /proc/<pid>/cmdline 是不是"正占着鼠标的守护进程实例"。
+
+    shebang 脚本的 cmdline 形如 ['python3', '<脚本路径>', ...],所以只认
+    argv[0](直接 exec)或 argv[1](经解释器)。故意写这么窄是为了排除
+    `journalctl -u mouse-gestures`、`nano mouse-gestures` 这类把名字
+    当参数的命令 —— 它们并不占设备。
+    """
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0])
+    script = os.path.basename(argv[1]) if len(argv) > 1 else ""
+    if not (exe == "mouse-gestures"
+            or ("python" in exe and script == "mouse-gestures")):
+        return False
+    # --doctor / --list-devices 是一次性子命令,跑完就退,不会占着设备
+    return not any(a in ONESHOT_FLAGS for a in argv)
+
+
+def daemon_already_running():
+    """除自己以外,是否还有 mouse-gestures 守护进程在跑。
+
+    不能 pgrep 'mouse-gestures' —— 会匹配到正在执行 --doctor 的自己;
+    也不能只匹配安装路径 'bin/mouse-gestures$' —— 那样从仓库里直接
+    ./mouse-gestures 跑起来的实例检测不到,自检会把它的设备独占误报成
+    keyd 冲突,把人指去改 /etc/keyd/default.conf。
+    """
+    me = os.getpid()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                argv = [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+        except OSError:          # 进程刚退出,或没权限读
+            continue
+        if is_daemon_argv(argv):
+            return True
+    return False
 
 
 def cmd_doctor(config_path):
@@ -339,10 +418,7 @@ def cmd_doctor(config_path):
 
     # 设备独占冲突 —— keyd 这类工具默认会 grab 所有输入设备,包括鼠标。
     # 本程序自己在跑时也会占着设备,那不算冲突,先排除掉这种情况。
-    self_running = subprocess.run(
-        ["pgrep", "-f", "bin/mouse-gestures$"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    if self_running:
+    if daemon_already_running():
         print("  [-] 鼠标独占检查已跳过 —— 守护进程正在运行(它本就占着设备)")
     elif mice and os.path.exists(config_path):
         try:
